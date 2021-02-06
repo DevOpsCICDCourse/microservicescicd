@@ -1,0 +1,201 @@
+
+String branchName = "${env.branchName}"
+String moduleName = "${JOB_NAME}".split("/")[1].split("-")[1]
+String srcUrl = "http://gitlab.idevops.site/microservicecicd/microservicecicd-demo-service.git"
+String commitId = "${env.commitId}"
+String projectId = "${env.projectId}"
+
+pipeline {
+    agent { node { label "build" } }
+
+    stages {
+        stage('GetCode') {
+            steps {
+                script {
+                    checkout([$class: 'GitSCM', 
+                            branches: [[name: "${branchName}"]], 
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [[$class: 'SparseCheckoutPaths', 
+                                        sparseCheckoutPaths: [[path: "${moduleName}"],[path: 'Dockerfile']]]], 
+                            submoduleCfg: [], 
+                            userRemoteConfigs: [[credentialsId: 'gitlab-admin-user',
+                                                url: "${srcUrl}"]]])
+                }
+                
+            }
+        }
+
+        stage("Build&Test"){
+            steps{
+                script{
+                    echo "Build..........."
+
+                    sh """
+                    cd ${moduleName} 
+                    mvn clean package
+
+                    """
+                }
+            }
+            post {
+                always {
+                    junit "${moduleName}/target/surefire-reports/*.xml"
+                }
+            }
+        }
+
+        stage("SonarScan"){
+            steps{
+                script{
+
+                    def sonarDate = sh returnStdout: true, script: 'date  +%Y%m%d%H%M%S'
+                    sonarDate = sonarDate - "\n"
+
+                    withCredentials([string(credentialsId: 'sonar-admin-user', variable: 'sonartoken'),
+                                    string(credentialsId: 'gitlab-user-token', variable: 'gitlabtoken')]) {
+                        // some block
+                        sh """
+                        cd ${moduleName} 
+                        sonar-scanner \
+                        -Dsonar.projectKey=${JOB_NAME} \
+                        -Dsonar.projectName=${JOB_NAME} \
+                        -Dsonar.projectVersion=${sonarDate} \
+                        -Dsonar.ws.timeout=30 \
+                        -Dsonar.projectDescription="xxxxxxx" \
+                        -Dsonar.links.homepage=http://www.baidu.com \
+                        -Dsonar.sources=src \
+                        -Dsonar.sourceEncoding=UTF-8 \
+                        -Dsonar.java.binaries=target/classes \
+                        -Dsonar.java.test.binaries=target/test-classes \
+                        -Dsonar.java.surefire.report=target/surefire-reports \
+                        -Dsonar.host.url="http://sonar.idevops.site" \
+                        -Dsonar.login=${sonartoken} \
+                        -Dsonar.gitlab.commit_sha=${commitId} \
+                        -Dsonar.gitlab.ref_name=${branchName} \
+                        -Dsonar.gitlab.project_id=${projectId} \
+                        -Dsonar.dynamicAnalysis=reuseReports \
+                        -Dsonar.gitlab.failure_notification_mode=commit-status \
+                        -Dsonar.gitlab.url=http://gitlab.idevops.site \
+                        -Dsonar.gitlab.user_token=${gitlabtoken} \
+                        -Dsonar.gitlab.api_version=v4
+
+                        """
+
+                    }
+ 
+                }
+            }
+        }
+
+        stage("BuildImage"){
+            steps{
+                script{
+
+                     withCredentials([usernamePassword(credentialsId: 'aliyun-registry-admin', passwordVariable: 'password', usernameVariable: 'username')]) {
+                
+                         env.nowDate = sh  returnStdout: true, script: 'date  +%Y%m%d%H%M%S'
+                         env.nowDate = env.nowDate - "\n"
+
+                         env.releaseVersion = "${env.branchName}"
+                         env.imageTag = "${releaseVersion}-${nowDate}-${commitId}"
+                         env.dockerImage = "registry.cn-beijing.aliyuncs.com/microservicecicd/microservicecicd-${moduleName}-service:${env.imageTag}"
+                         env.jarName = "${moduleName}-${branchName}-${commitId}"
+                         sh """
+                             docker login -u ${username} -p ${password}  registry.cn-beijing.aliyuncs.com
+                             cd ${moduleName} && docker build -t ${dockerImage} -f ../Dockerfile --build-arg SERVICE_NAME=${jarName} .
+                             sleep 1
+                             docker push ${dockerImage}
+                             sleep 1
+                             docker rmi ${dockerImage}
+                          """
+                    }
+
+
+                }
+            }
+        }
+
+        stage("PushFile"){
+          // when {
+          //   expression { "${env.branchName}".contains("RELEASE-") }
+          // }
+          steps{
+            script{
+              if ("${env.branchName}".contains("RELEASE-")){
+                println("branchName = branchName")
+                env.branchName = "master"
+
+              } else {
+                env.branchName = "feature"
+              }
+
+                for (i = 0; i < 3; i++) {
+                    //下载版本库文件 
+                    response = GetRepoFile(40,"${moduleName}%2fvalues.yaml", "${env.branchName}")
+                    //println(response)
+                    
+                    //替换文件中内容
+                    yamlData = readYaml text: """${response}"""
+
+                    println(yamlData.image.version)
+                    println(yamlData.image.commit)
+                    yamlData.image.version = "${releaseVersion}-${env.nowDate}"
+                    yamlData.image.commit  = "${commitId}"
+
+                    println(yamlData.toString())
+
+                    sh "rm -fr test.yaml"
+                    writeYaml charset: 'UTF-8', data: yamlData, file: 'test.yaml'
+                    newYaml = sh returnStdout: true, script: 'cat test.yaml'
+                    
+                    println(newYaml)
+                    //更新gitlab文件内容
+                    base64Content = newYaml.bytes.encodeBase64().toString()
+
+                    // 会有并行问题，同时更新报错
+                    try {
+                      UpdateRepoFile(40,"${moduleName}%2fvalues.yaml",base64Content, "${env.branchName}")
+                      break;
+                    } catch(e){
+                      sh "sleep 2"
+                      continue;
+                    }
+                }
+            }
+          }
+        }
+    }
+}
+
+//封装HTTP请求
+def HttpReq(reqType,reqUrl,reqBody){
+    def gitServer = "http://gitlab.idevops.site/api/v4"
+    withCredentials([string(credentialsId: 'gitlab-token', variable: 'gitlabToken')]) {
+      result = httpRequest customHeaders: [[maskValue: true, name: 'PRIVATE-TOKEN', value: "${gitlabToken}"]], 
+                httpMode: reqType, 
+                contentType: "APPLICATION_JSON",
+                consoleLogResponseBody: true,
+                ignoreSslErrors: true, 
+                requestBody: reqBody,
+                url: "${gitServer}/${reqUrl}"
+                //quiet: true
+    }
+    return result
+}
+
+
+//获取文件内容
+def GetRepoFile(projectId,filePath,branchName){
+    apiUrl = "projects/${projectId}/repository/files/${filePath}/raw?ref=${branchName}"
+    response = HttpReq('GET',apiUrl,'')
+    return response.content
+}
+
+//更新文件内容
+def UpdateRepoFile(projectId,filePath,fileContent, branchName){
+    apiUrl = "projects/${projectId}/repository/files/${filePath}"
+    reqBody = """{"branch": "${branchName}","encoding":"base64", "content": "${fileContent}", "commit_message": "update a new file"}"""
+    response = HttpReq('PUT',apiUrl,reqBody)
+    println(response)
+
+}
