@@ -1,0 +1,43 @@
+String serviceName ="${JOB_NAME}".split("-")[1]
+String nameSpace = "${JOB_NAME}".split("-")[0].split("/")[-1]
+
+
+//pipeline
+pipeline{
+    agent { node { label "k8s"}}
+    
+    stages{
+
+       stage("GetCode"){
+            steps{
+                script{
+                    println("${branchName}")
+                    println("${env.branchName}".contains("RELEASE-"))
+                    println "获取代码"
+                    checkout([$class: 'GitSCM', branches: [[name: "${env.branchName}"]], 
+                                      doGenerateSubmoduleConfigurations: false, 
+                                      extensions: [[$class: 'SparseCheckoutPaths', 
+                                                    sparseCheckoutPaths: [[path: "${serviceName}"]]]], 
+                                      submoduleCfg: [], 
+                                      userRemoteConfigs: [[credentialsId: 'gitlab-admin-user', url: "http://gitlab.idevops.site/microservicecicd/microservicecicd-env.git"]]])
+                }
+            }
+        }
+
+        stage("HelmDeploy"){
+            steps{
+                script{
+                  sh """
+                      kubectl create ns "${nameSpace}-uat"  || echo false
+
+                      helm install "${serviceName}" --namespace "${nameSpace}-uat" ./"${serviceName}" ||  helm upgrade "${serviceName}" --namespace "${nameSpace}-uat" ./"${serviceName}"
+
+                      helm list --namespace "${nameSpace}-uat"
+                      helm history "${serviceName}" --namespace "${nameSpace}-uat"
+
+                  """
+                }
+            }
+        }
+    }
+}
