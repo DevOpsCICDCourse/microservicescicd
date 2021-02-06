@@ -1,0 +1,157 @@
+
+pipeline {
+    agent { node { label "build"}}
+
+    stages{
+
+        stage("FileterData"){
+            steps{
+                script{
+                    response = readJSON text: """${webHookData}"""
+
+                    println(response)
+
+                    env.eventType = response["webhookEvent"]
+
+                    switch(eventType) {
+                        case ["jira:issue_created" , "jira:issue_updated" ]:
+                            env.issueName = response['issue']['key']
+                            env.userName = response['user']['name']
+                            env.moduleNames = response['issue']['fields']['components']
+                            env.fixVersion = response['issue']['fields']['fixVersions']
+                            currentBuild.description = " Trigger by ${userName} ${eventType} ${issueName} "
+                            break
+                            
+
+                        default:
+                            println("hello")
+                    }
+                }
+            }
+        }
+
+        stage("CreateBranchOrMR"){
+
+            when {
+                anyOf {
+                    environment name: 'eventType', value: 'jira:issue_created'   //issue 创建 /更新
+                    environment name: 'eventType', value: 'jira:issue_updated' 
+                }
+            }
+
+            steps{
+                script{
+                    def projectIds = []
+                    println(issueName)
+                    fixVersion = readJSON text: """${fixVersion}"""
+                    println(fixVersion.size())
+
+                    //获取项目Id
+                    def projects = readJSON text: """${moduleNames}"""
+                    for ( project in projects){
+                        println(project["name"])
+                        projectName = project["name"]
+                        currentBuild.description += "\n project: ${projectName}"
+                        groupName = projectName.split("-")[0]
+                        
+                        try {
+                            projectId = GetProjectID(groupName, projectName)
+                            println(projectId)
+                            projectIds.add(projectId)   
+                        } catch(e){
+                            println(e)
+                            println("未获取到项目ID，请检查模块名称！")
+                        }
+                    } 
+
+                    println(projectIds)  
+
+
+                    if (fixVersion.size() == 0) {
+                        for (id in projectIds){
+                            println("新建特性分支--> ${id} --> ${issueName}")
+                            currentBuild.description += "\n 新建特性分支--> ${id} --> ${issueName}"
+                            CreateBranch(id,"master","${issueName}")
+                        }
+                            
+                        
+
+                    } else {
+                        fixVersion = fixVersion[0]['name']
+                        println("Issue关联release操作,Jenkins创建合并请求")
+                        currentBuild.description += "\n Issue关联release操作,Jenkins创建合并请求 \n ${issueName} --> RELEASE-${fixVersion}" 
+                        
+                        for (id in projectIds){
+
+                            println("创建RELEASE-->${id} -->${fixVersion}分支")
+                            CreateBranch(id,"master","RELEASE-${fixVersion}")
+
+
+                            
+                            println("创建合并请求 ${issueName} ---> RELEASE-${fixVersion}")
+                            CreateMr(id,"${issueName}","RELEASE-${fixVersion}","${issueName}--->RELEASE-${fixVersion}")
+                            
+                        }
+                    } 
+                }
+            }
+        }
+    }
+}
+
+//封装HTTP请求
+def HttpReq(reqType,reqUrl,reqBody){
+    def gitServer = "http://gitlab.idevops.site/api/v4"
+    withCredentials([string(credentialsId: 'gitlab-token', variable: 'gitlabToken')]) {
+      result = httpRequest customHeaders: [[maskValue: true, name: 'PRIVATE-TOKEN', value: "${gitlabToken}"]], 
+                httpMode: reqType, 
+                contentType: "APPLICATION_JSON",
+                consoleLogResponseBody: true,
+                ignoreSslErrors: true, 
+                requestBody: reqBody,
+                url: "${gitServer}/${reqUrl}"
+                //quiet: true
+    }
+    return result
+}
+//获取项目ID
+def GetProjectID(repoName='',projectName){
+    projectApi = "projects?search=${projectName}"
+    response = HttpReq('GET',projectApi,'')
+    def result = readJSON text: """${response.content}"""
+    
+    for (repo in result){
+       // println(repo['path_with_namespace'])
+        if (repo['path'] == "${projectName}"){
+            
+            repoId = repo['id']
+            println(repoId)
+        }
+    }
+    return repoId
+}
+
+
+//创建分支
+def CreateBranch(projectId,refBranch,newBranch){
+    try {
+        branchApi = "projects/${projectId}/repository/branches?branch=${newBranch}&ref=${refBranch}"
+        response = HttpReq("POST",branchApi,'').content
+        branchInfo = readJSON text: """${response}"""
+    } catch(e){
+        println(e)
+    }  //println(branchInfo)
+}
+
+//创建合并请求
+def CreateMr(projectId,sourceBranch,targetBranch,title,assigneeUser=""){
+    try {
+        def mrUrl = "projects/${projectId}/merge_requests"
+        def reqBody = """{"source_branch":"${sourceBranch}", "target_branch": "${targetBranch}","title":"${title}","assignee_id":"${assigneeUser}"}"""
+        response = HttpReq("POST",mrUrl,reqBody).content
+        return response
+    } catch(e){
+        println(e)
+    }
+}
+
