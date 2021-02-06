@@ -1,0 +1,91 @@
+pipeline {
+
+	agent any 
+
+
+	stages{
+
+		stage("GetData"){
+			steps{
+				script {
+					echo "${webHookData}"
+
+					data = readJSON  text: "${webHookData}"
+
+					println(data)
+
+					env.branchName = data.ref - "refs/heads/"
+					env.commitId = data.checkout_sha
+					env.projectId = data.project_id
+					commits = data["commits"]
+
+					println("${env.branchName}")
+					println("${env.commitID}")
+					println("${env.projectId}")
+
+					//env.moduleName = "service01"
+					changeServices = []
+                    for(commit in commits) {
+                        println(commit.id)
+
+                        //added
+                        for (add in commit.added) {
+                            s = add.split("/") as List
+                            if (s.size() > 1){
+                                if (changeServices.indexOf(s[0]) == -1){
+                                    changeServices.add(s[0])
+                                }
+                            }
+                        }
+
+                        //modified
+                        for (m in commit.modified) {
+                            s = m.split("/") as List
+                            // println s
+                            // println s.size()
+                            // println s[0]
+                            if (s.size() > 1){
+                                // println changeServices.indexOf(s[0])
+                                if (changeServices.indexOf(s[0]) == -1){
+                                    changeServices.add(s[0])
+                                }
+                            }
+                        }
+
+                        //removed
+                        for (r in commit.removed) {
+                            s = r.split("/") as List
+                            println s
+                            if (s.size() > 1){
+                                if (changeServices.indexOf(s[0]) == -1){
+                                    changeServices.add(s[0])
+                                }
+                            }
+                        }
+                    }
+
+                    println(changeServices)
+                    //currentBuild.description = " Trigger by  ${eventType} ${changeServices} 
+				}
+			}
+		}
+
+		stage('DefineService') {
+            steps {
+                script{
+                    println(changeServices)
+                    //服务构建顺序控制
+                    services = ['service02', 'service01']
+                    for (service in services){
+                        if (changeServices.indexOf(service) != -1){
+                            jobName = 'microservicecicd-'+service+'-service-CI'
+                            build job: jobName, wait: false,  parameters: [string(name: 'branchName', value: "${env.branchName}" ),
+                                                                           string(name: 'commitId',   value: "${env.commitId}" ), 
+                                                                           string(name: 'projectId',  value: "${env.projectId}" )]
+                        }
+                    }
+                }
+            }
+        }
+	}
+}
